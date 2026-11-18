@@ -22,7 +22,9 @@ for (const key of required) {
 const config = {
   NODE_ENV:   process.env.NODE_ENV   || 'development',
   PORT:       parseInt(process.env.PORT, 10) || 5000,
-  CLIENT_URL: process.env.CLIENT_URL || 'http://localhost:5173',
+  // Origins never carry a trailing slash, and CORS compares the value
+  // byte-for-byte — "https://app.vercel.app/" would block "https://app.vercel.app".
+  CLIENT_URL: (process.env.CLIENT_URL || 'http://localhost:5173').replace(/\/+$/, ''),
 
   // MongoDB (used in a later step)
   MONGODB_URI: process.env.MONGODB_URI || '',
