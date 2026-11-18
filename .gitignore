@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Environment files — real values are never committed; the template stays tracked
+.env
+.env.*
+!.env.example
+
+# Uploaded corpus files (PDFs). Keep the directory via .gitkeep.
+/uploads/*
+!/uploads/.gitkeep
+
+# Downloaded ONNX model weights (~87 MB, regenerated automatically).
+# Anchored to the Backend root so src/models/ (Mongoose schemas) stays tracked.
+/models/
+
+# Logs
+/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output (if added later)
+/dist/
+/build/
+
+# Test / tooling artifacts
+/coverage/
+/.nyc_output/
+/.vercel/
+/tmp/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
