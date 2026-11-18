@@ -59,7 +59,7 @@ const readError = async (response) => {
   }
 };
 
-const toFriendlyError = (status, message) => {
+const toFriendlyError = (status, message, model) => {
   if (status === 400 && /api[\s_-]?key/i.test(message)) {
     return 'GEMINI_API_KEY was rejected by Google. Check the key in the server environment.';
   }
@@ -67,7 +67,7 @@ const toFriendlyError = (status, message) => {
     return `Gemini denied the request (${message}). Check that the key is enabled for the Generative Language API.`;
   }
   if (status === 404) {
-    return `Gemini model "${config.GEMINI_MODEL}" is not available for this API key (${message}).`;
+    return `Gemini model "${model}" is not available for this API key (${message}).`;
   }
   if (status === 429) {
     return 'Gemini rate limit reached. Free-tier quotas reset per minute — try again shortly.';
@@ -76,6 +76,116 @@ const toFriendlyError = (status, message) => {
     return `Gemini is temporarily unavailable (${message}).`;
   }
   return `Gemini returned HTTP ${status}: ${message}`;
+};
+
+// ── Model discovery ───────────────────────────────────────────────────────────
+// Google retires model ids for new API keys (gemini-2.5-flash already answers
+// "no longer available to new users"), so the configured id is treated as a
+// preference, not a guarantee. The first usable id from the live catalogue is
+// cached per process and re-resolved whenever the API reports a 404.
+
+const UNSUITABLE_MODEL = /embedding|aqa|imagen|veo|tts|live|native-audio|image-preview/i;
+
+/**
+ * @returns {Promise<string[]>} model ids without the "models/" prefix
+ */
+const listAvailableModels = async () => {
+  const response = await fetchWithTimeout(
+    `${API_ROOT}?pageSize=1000`,
+    { method: 'GET', headers: { 'x-goog-api-key': config.GEMINI_API_KEY } },
+    5_000
+  );
+
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+
+  const { models = [] } = await response.json();
+
+  return models
+    .filter((model) => model.supportedGenerationMethods?.includes('generateContent'))
+    .map((model) => (model.name ?? '').replace(/^models\//, ''))
+    .filter((id) => id && !UNSUITABLE_MODEL.test(id));
+};
+
+/**
+ * Ranked preference: the configured id, then the newest plain flash model,
+ * any flash variant, a plain pro model, then whatever is available.
+ *
+ * @param {string[]} ids
+ * @returns {string|null}
+ */
+const pickModel = (ids) => {
+  const ranked = [...ids].sort((a, b) => {
+    const version = (id) => parseFloat(id.match(/gemini-([\d.]+)/)?.[1] ?? '0');
+    return version(b) - version(a);
+  });
+
+  const preferences = [
+    (id) => id === config.GEMINI_MODEL,
+    (id) => /^gemini-[\d.]+-flash$/.test(id),
+    (id) => /flash/.test(id),
+    (id) => /^gemini-[\d.]+-pro$/.test(id),
+    () => true,
+  ];
+
+  for (const matches of preferences) {
+    const found = ranked.find(matches);
+    if (found) return found;
+  }
+
+  return null;
+};
+
+let modelInUse = null;
+let modelLookup = null;
+
+/**
+ * The model id to call right now. No network call: the configured id is used
+ * until the API rejects it, so the common path stays a single request.
+ *
+ * @returns {Promise<string>}
+ */
+const resolveModel = async () => {
+  if (modelInUse) return modelInUse;
+  modelInUse = config.GEMINI_MODEL;
+  return modelInUse;
+};
+
+/**
+ * Replaces the cached model with the best one the key can actually use.
+ * Guarded so concurrent requests share one catalogue fetch.
+ *
+ * @returns {Promise<string>}
+ */
+const discoverModel = async () => {
+  if (modelLookup) return modelLookup;
+
+  modelLookup = (async () => {
+    try {
+      const ids = await listAvailableModels();
+      const picked = pickModel(ids);
+
+      if (picked && picked !== config.GEMINI_MODEL) {
+        console.warn(
+          `⚠️  Gemini model "${config.GEMINI_MODEL}" is unavailable for this key; using "${picked}".`
+        );
+      }
+
+      modelInUse = picked ?? config.GEMINI_MODEL;
+    } catch (err) {
+      console.warn(
+        `⚠️  Could not list Gemini models (${err.message}); using "${config.GEMINI_MODEL}".`
+      );
+      modelInUse = config.GEMINI_MODEL;
+    }
+
+    return modelInUse;
+  })().finally(() => {
+    modelLookup = null;
+  });
+
+  return modelLookup;
 };
 
 /**
@@ -145,14 +255,14 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
     throw new Error('chatCompletion requires both a system and a user message.');
   }
 
-  const model = config.GEMINI_MODEL;
-  const url = `${API_ROOT}/${encodeURIComponent(model)}:generateContent`;
   const startedAt = Date.now();
-
   let lastError = null;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await sleep(RETRY_DELAY_MS);
+
+    const model = await resolveModel();
+    const url = `${API_ROOT}/${encodeURIComponent(model)}:generateContent`;
 
     let response;
     try {
@@ -197,7 +307,15 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
     }
 
     const message = await readError(response);
-    lastError = new Error(toFriendlyError(response.status, message));
+    lastError = new Error(toFriendlyError(response.status, message, model));
+
+    // A retired model reads as 404: drop the cached choice, resolve against
+    // the live catalogue and try once more.
+    if (response.status === 404 && attempt === 0) {
+      modelInUse = null;
+      await discoverModel();
+      continue;
+    }
 
     if (!RETRYABLE_STATUS.has(response.status)) break;
   }
@@ -206,47 +324,42 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
 };
 
 /**
- * Confirms the API key works and the configured model exists.
+ * Confirms the API key works and reports which model will actually be used.
  *
- * @returns {Promise<{ ok: boolean, provider: 'gemini', model: string, error?: string }>}
+ * @returns {Promise<{ ok: boolean, provider: 'gemini', model: string, configuredModel: string, availableModels?: string[], error?: string }>}
  */
 export const checkHealth = async () => {
-  const base = { provider: 'gemini', model: config.GEMINI_MODEL };
-
   if (!config.GEMINI_API_KEY) {
-    return { ...base, ok: false, error: 'GEMINI_API_KEY is not set.' };
+    return {
+      ok: false,
+      provider: 'gemini',
+      model: config.GEMINI_MODEL,
+      configuredModel: config.GEMINI_MODEL,
+      error: 'GEMINI_API_KEY is not set.',
+    };
   }
 
   try {
-    const response = await fetchWithTimeout(
-      `${API_ROOT}?pageSize=50`,
-      { method: 'GET', headers: { 'x-goog-api-key': config.GEMINI_API_KEY } },
-      5_000
-    );
-
-    if (!response.ok) {
-      return { ...base, ok: false, error: await readError(response) };
-    }
-
-    const { models = [] } = await response.json();
-    const names = models.map((model) => (model.name ?? '').replace(/^models\//, ''));
-    const modelAvailable = names.includes(config.GEMINI_MODEL);
+    // Health must fail loudly, so it lists the catalogue directly instead of
+    // going through discoverModel, which swallows listing errors.
+    const ids = await listAvailableModels();
+    const model = pickModel(ids) ?? config.GEMINI_MODEL;
+    modelInUse = model;
 
     return {
-      ...base,
-      ok: true,
-      modelAvailable,
-      error: modelAvailable
-        ? undefined
-        : `Model "${config.GEMINI_MODEL}" is not listed for this key. Set GEMINI_MODEL to one of: ${names.slice(0, 6).join(', ')}`,
+      ok:              true,
+      provider:        'gemini',
+      model,
+      configuredModel: config.GEMINI_MODEL,
+      availableModels: ids.slice(0, 10),
     };
   } catch (err) {
     return {
-      ...base,
-      ok: false,
-      error: err.name === 'AbortError'
-        ? 'Gemini did not respond within 5 seconds.'
-        : `Cannot reach the Gemini API: ${err.message}`,
+      ok:    false,
+      provider: 'gemini',
+      model: config.GEMINI_MODEL,
+      configuredModel: config.GEMINI_MODEL,
+      error: `Cannot list Gemini models: ${err.message}`,
     };
   }
 };

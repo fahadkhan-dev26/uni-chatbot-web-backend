@@ -74,7 +74,9 @@ const config = {
 
   // Gemini
   GEMINI_API_KEY:    process.env.GEMINI_API_KEY || '',
-  GEMINI_MODEL:      process.env.GEMINI_MODEL   || 'gemini-2.5-flash',
+  // Preference only: Google retires model ids for new keys, so geminiService
+  // falls back to the newest available flash model if this one is rejected.
+  GEMINI_MODEL:      process.env.GEMINI_MODEL   || 'gemini-3.8-flash',
   GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS, 10) || 30_000,
   // Thinking models spend part of this budget before writing the answer, so
   // the default is larger than the Ollama one; a citation-tailed answer is
