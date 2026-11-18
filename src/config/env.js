@@ -77,8 +77,8 @@ const config = {
   // Preference only: Google retires model ids for new keys, so geminiService
   // falls back to the newest available flash model if this one is rejected.
   GEMINI_MODEL:      process.env.GEMINI_MODEL   || 'gemini-3.8-flash',
-  // Bounded so three failover attempts stay under the serverless time limit.
-  GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS, 10) || 15_000,
+  // Bounded so four failover attempts stay under the serverless time limit.
+  GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS, 10) || 10_000,
   // Thinking models spend part of this budget before writing the answer, so
   // the default is larger than the Ollama one; a citation-tailed answer is
   // only ~200 tokens.

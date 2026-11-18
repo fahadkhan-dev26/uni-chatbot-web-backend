@@ -23,9 +23,11 @@ const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 // Fail over to another model when the id is retired, the quota is spent, or
 // the model is saturated (Google answers 503 "experiencing high demand").
+// Saturation is per model, so the attempts deliberately span different model
+// families (flash → lite → pro) rather than neighbouring versions.
 const FAILOVER_STATUS = new Set([404, 429, 500, 503, 504]);
 const RETRY_DELAY_MS = 800;
-const MAX_MODEL_ATTEMPTS = 3;
+const MAX_MODEL_ATTEMPTS = 4;
 const CATALOGUE_TTL_MS = 10 * 60 * 1000;
 
 /**
@@ -87,7 +89,10 @@ const toFriendlyError = (status, message, model) => {
 // single id cannot be trusted. The catalogue is fetched after the first failure
 // and ranked; the request then fails over across the ranked ids.
 
-const UNSUITABLE_MODEL = /embedding|aqa|imagen|veo|tts|live|native-audio|image-preview/i;
+// Non-chat endpoints that also advertise generateContent are useless here:
+// images, audio, transcription, research agents, robots.
+const UNSUITABLE_MODEL =
+  /embedding|aqa|imagen|veo|tts|live|native-audio|image|transcribe|lyria|robotics|nano-banana|deep-research|antigravity|computer-use|omni/i;
 
 /**
  * @returns {Promise<string[]>} model ids without the "models/" prefix
@@ -112,8 +117,10 @@ const listAvailableModels = async () => {
 };
 
 /**
- * Orders ids by preference: configured, newest plain flash, any flash variant,
- * plain pro, then the rest. Newest version first within each group.
+ * Orders ids so that consecutive failover attempts land in different model
+ * families. Saturation is per model, so trying 3.8 → 3.7 → 3.6 flash is
+ * useless when the whole flash line is busy; interleaving the groups puts the
+ * stable alias, the lite line and the pro line within the first four attempts.
  *
  * @param {string[]} ids
  * @returns {string[]}
@@ -124,17 +131,31 @@ const rankModels = (ids) => {
 
   const preferences = [
     (id) => id === config.GEMINI_MODEL,
+    (id) => id === 'gemini-flash-latest',
+    (id) => id === 'gemini-flash-lite-latest',
+    (id) => id === 'gemini-pro-latest',
     (id) => /^gemini-[\d.]+-flash$/.test(id),
-    (id) => /flash/.test(id),
+    (id) => /flash-lite/.test(id),
     (id) => /^gemini-[\d.]+-pro$/.test(id),
+    (id) => /gemma/.test(id),
     () => true,
   ];
 
-  const ordered = [];
+  // Each id joins the first group it matches, so later groups only receive
+  // ids the earlier ones did not claim.
+  const groups = preferences.map(() => []);
 
-  for (const matches of preferences) {
-    for (const id of ranked) {
-      if (matches(id) && !ordered.includes(id)) ordered.push(id);
+  for (const id of ranked) {
+    const index = preferences.findIndex((matches) => matches(id));
+    groups[index].push(id);
+  }
+
+  const ordered = [];
+  const longest = Math.max(...groups.map((group) => group.length));
+
+  for (let round = 0; round < longest; round++) {
+    for (const group of groups) {
+      if (group[round]) ordered.push(group[round]);
     }
   }
 
@@ -144,6 +165,9 @@ const rankModels = (ids) => {
 let catalogue = null;          // { ids: string[], fetchedAt: number }
 let catalogueLookup = null;
 let modelInUse = null;
+// Ids Google rejected with 404 in this process — the catalogue lists models a
+// new key cannot actually call, so they must be filtered out permanently.
+const retiredModels = new Set();
 
 /**
  * Loads and ranks the catalogue, cached for a few minutes so a wave of failed
@@ -181,9 +205,9 @@ const loadCatalogue = async ({ force = false } = {}) => {
  *
  * @returns {string[]}
  */
-const candidateModels = () => [
-  ...new Set([modelInUse, config.GEMINI_MODEL, ...(catalogue?.ids ?? [])].filter(Boolean)),
-];
+const candidateModels = () =>
+  [...new Set([modelInUse, config.GEMINI_MODEL, ...(catalogue?.ids ?? [])].filter(Boolean))]
+    .filter((id) => !retiredModels.has(id));
 
 /**
  * Builds the request body. Images become inlineData parts, which is how
@@ -349,6 +373,8 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
     }
 
     lastError = new Error(result.error);
+
+    if (result.status === 404) retiredModels.add(model);
 
     if (!FAILOVER_STATUS.has(result.status)) break;
   }
