@@ -132,6 +132,8 @@ export const answerQuestion = async (question, opts = {}) => {
         topScore:         chunks[0]?.score ?? null,
         attachmentNotice,
         llmError:         err.message,
+        llmTriedModels:   err.triedModels ?? null,
+        llmAvailableModels: err.availableModels ?? null,
       },
     };
   }

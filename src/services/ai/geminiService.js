@@ -353,7 +353,13 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
     if (!FAILOVER_STATUS.has(result.status)) break;
   }
 
-  throw lastError ?? new Error('Gemini produced no answer.');
+  // Attached so callers can report exactly what was attempted (see
+  // meta.llmTriedModels) — the catalogue is otherwise invisible in production.
+  const error = lastError ?? new Error('Gemini produced no answer.');
+  error.triedModels = tried;
+  error.availableModels = catalogue?.ids ?? [];
+
+  throw error;
 };
 
 /**
