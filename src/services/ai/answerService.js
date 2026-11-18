@@ -133,7 +133,6 @@ export const answerQuestion = async (question, opts = {}) => {
         attachmentNotice,
         llmError:         err.message,
         llmTriedModels:   err.triedModels ?? null,
-        llmAvailableModels: err.availableModels ?? null,
       },
     };
   }
