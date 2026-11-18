@@ -21,9 +21,12 @@ import config from '../../config/env.js';
 
 const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// One retry covers the transient 429/503 bursts the free tier produces.
-const RETRYABLE_STATUS = new Set([429, 500, 503]);
-const RETRY_DELAY_MS = 1200;
+// Fail over to another model when the id is retired, the quota is spent, or
+// the model is saturated (Google answers 503 "experiencing high demand").
+const FAILOVER_STATUS = new Set([404, 429, 500, 503, 504]);
+const RETRY_DELAY_MS = 800;
+const MAX_MODEL_ATTEMPTS = 3;
+const CATALOGUE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * @param {string} url
@@ -80,9 +83,9 @@ const toFriendlyError = (status, message, model) => {
 
 // ── Model discovery ───────────────────────────────────────────────────────────
 // Google retires model ids for new API keys (gemini-2.5-flash already answers
-// "no longer available to new users"), so the configured id is treated as a
-// preference, not a guarantee. The first usable id from the live catalogue is
-// cached per process and re-resolved whenever the API reports a 404.
+// "no longer available to new users") and individual models get saturated, so a
+// single id cannot be trusted. The catalogue is fetched after the first failure
+// and ranked; the request then fails over across the ranked ids.
 
 const UNSUITABLE_MODEL = /embedding|aqa|imagen|veo|tts|live|native-audio|image-preview/i;
 
@@ -109,17 +112,15 @@ const listAvailableModels = async () => {
 };
 
 /**
- * Ranked preference: the configured id, then the newest plain flash model,
- * any flash variant, a plain pro model, then whatever is available.
+ * Orders ids by preference: configured, newest plain flash, any flash variant,
+ * plain pro, then the rest. Newest version first within each group.
  *
  * @param {string[]} ids
- * @returns {string|null}
+ * @returns {string[]}
  */
-const pickModel = (ids) => {
-  const ranked = [...ids].sort((a, b) => {
-    const version = (id) => parseFloat(id.match(/gemini-([\d.]+)/)?.[1] ?? '0');
-    return version(b) - version(a);
-  });
+const rankModels = (ids) => {
+  const version = (id) => parseFloat(id.match(/gemini-([\d.]+)/)?.[1] ?? '0');
+  const ranked = [...ids].sort((a, b) => version(b) - version(a));
 
   const preferences = [
     (id) => id === config.GEMINI_MODEL,
@@ -129,64 +130,60 @@ const pickModel = (ids) => {
     () => true,
   ];
 
+  const ordered = [];
+
   for (const matches of preferences) {
-    const found = ranked.find(matches);
-    if (found) return found;
+    for (const id of ranked) {
+      if (matches(id) && !ordered.includes(id)) ordered.push(id);
+    }
   }
 
-  return null;
+  return ordered;
 };
 
+let catalogue = null;          // { ids: string[], fetchedAt: number }
+let catalogueLookup = null;
 let modelInUse = null;
-let modelLookup = null;
 
 /**
- * The model id to call right now. No network call: the configured id is used
- * until the API rejects it, so the common path stays a single request.
+ * Loads and ranks the catalogue, cached for a few minutes so a wave of failed
+ * requests does not turn into a wave of listing calls.
  *
- * @returns {Promise<string>}
+ * @param {{ force?: boolean }} [opts]
+ * @returns {Promise<string[]>}
  */
-const resolveModel = async () => {
-  if (modelInUse) return modelInUse;
-  modelInUse = config.GEMINI_MODEL;
-  return modelInUse;
-};
+const loadCatalogue = async ({ force = false } = {}) => {
+  if (!force && catalogue && Date.now() - catalogue.fetchedAt < CATALOGUE_TTL_MS) {
+    return catalogue.ids;
+  }
+  if (catalogueLookup) return catalogueLookup;
 
-/**
- * Replaces the cached model with the best one the key can actually use.
- * Guarded so concurrent requests share one catalogue fetch.
- *
- * @returns {Promise<string>}
- */
-const discoverModel = async () => {
-  if (modelLookup) return modelLookup;
-
-  modelLookup = (async () => {
+  catalogueLookup = (async () => {
     try {
-      const ids = await listAvailableModels();
-      const picked = pickModel(ids);
-
-      if (picked && picked !== config.GEMINI_MODEL) {
-        console.warn(
-          `⚠️  Gemini model "${config.GEMINI_MODEL}" is unavailable for this key; using "${picked}".`
-        );
-      }
-
-      modelInUse = picked ?? config.GEMINI_MODEL;
+      const ids = rankModels(await listAvailableModels());
+      catalogue = { ids, fetchedAt: Date.now() };
+      return ids;
     } catch (err) {
-      console.warn(
-        `⚠️  Could not list Gemini models (${err.message}); using "${config.GEMINI_MODEL}".`
-      );
-      modelInUse = config.GEMINI_MODEL;
+      console.warn(`⚠️  Could not list Gemini models (${err.message}).`);
+      return [];
     }
-
-    return modelInUse;
   })().finally(() => {
-    modelLookup = null;
+    catalogueLookup = null;
   });
 
-  return modelLookup;
+  return catalogueLookup;
 };
+
+/**
+ * Candidate ids in the order they should be tried. The configured id goes
+ * first so a healthy setup never pays for a listing round trip; ranked
+ * catalogue entries follow once a failure has been seen.
+ *
+ * @returns {string[]}
+ */
+const candidateModels = () => [
+  ...new Set([modelInUse, config.GEMINI_MODEL, ...(catalogue?.ids ?? [])].filter(Boolean)),
+];
 
 /**
  * Builds the request body. Images become inlineData parts, which is how
@@ -238,14 +235,80 @@ const extractText = (data) => {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
+ * One request to one model. Never throws for API-level failures — the caller
+ * decides whether the status is worth another model.
+ *
+ * @returns {Promise<{ ok: true, text: string, model: string } | { ok: false, status: number, error: string }>}
+ */
+const requestModel = async (model, { system, user, images }, opts) => {
+  const url = `${API_ROOT}/${encodeURIComponent(model)}:generateContent`;
+
+  let response;
+  try {
+    response = await fetchWithTimeout(
+      url,
+      {
+        method:  'POST',
+        headers: {
+          'Content-Type':   'application/json',
+          'x-goog-api-key': config.GEMINI_API_KEY,
+        },
+        body: JSON.stringify(buildBody({ system, user, images }, opts)),
+      },
+      config.GEMINI_TIMEOUT_MS
+    );
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return {
+        ok:     false,
+        status: 504,
+        error:  `Gemini model "${model}" did not answer within ${config.GEMINI_TIMEOUT_MS / 1000}s.`,
+      };
+    }
+    throw new Error(`Cannot reach the Gemini API: ${err.message}`);
+  }
+
+  if (response.ok) {
+    const data = await response.json();
+    const text = extractText(data);
+
+    if (!text) {
+      const blocked = data?.promptFeedback?.blockReason;
+      const finishReason = data?.candidates?.[0]?.finishReason;
+
+      // Content-level refusal: another model would refuse the same prompt.
+      return {
+        ok:     false,
+        status: 422,
+        error:  blocked
+          ? `Gemini blocked the request (${blocked}).`
+          : `Gemini returned no text (finishReason: ${finishReason ?? 'unknown'}).`,
+      };
+    }
+
+    return { ok: true, text, model: data.modelVersion ?? model };
+  }
+
+  return {
+    ok:     false,
+    status: response.status,
+    error:  toFriendlyError(response.status, await readError(response), model),
+  };
+};
+
+/**
  * Sends one grounded request to Gemini and returns the generated text.
+ *
+ * If the configured model is retired or saturated, the same request is retried
+ * on the next-ranked model from the live catalogue, so a retired or overloaded
+ * id degrades to a working model instead of the fixed fallback.
  *
  * @param {{ system: string, user: string, images?: { data: string, type?: string }[] }} messages
  * @param {object} [opts]
  * @param {number} [opts.temperature]
  * @param {number} [opts.maxTokens]
  * @returns {Promise<{ text: string, model: string, evalDurationMs: number }>}
- * @throws {Error} on missing key, network failure, timeout, or API error
+ * @throws {Error} on missing key, network failure, or when every candidate fails
  */
 export const chatCompletion = async ({ system, user, images }, opts = {}) => {
   if (!config.GEMINI_API_KEY) {
@@ -256,71 +319,41 @@ export const chatCompletion = async ({ system, user, images }, opts = {}) => {
   }
 
   const startedAt = Date.now();
+  const tried = [];
   let lastError = null;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < MAX_MODEL_ATTEMPTS; attempt++) {
     if (attempt > 0) await sleep(RETRY_DELAY_MS);
 
-    const model = await resolveModel();
-    const url = `${API_ROOT}/${encodeURIComponent(model)}:generateContent`;
+    // Only after a failure is the catalogue worth a round trip.
+    if (attempt > 0 && !catalogue) await loadCatalogue();
 
-    let response;
-    try {
-      response = await fetchWithTimeout(
-        url,
-        {
-          method:  'POST',
-          headers: {
-            'Content-Type':   'application/json',
-            'x-goog-api-key': config.GEMINI_API_KEY,
-          },
-          body: JSON.stringify(buildBody({ system, user, images }, opts)),
-        },
-        config.GEMINI_TIMEOUT_MS
-      );
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        throw new Error(`Gemini did not answer within ${config.GEMINI_TIMEOUT_MS / 1000}s.`);
+    const model = candidateModels().find((id) => !tried.includes(id));
+    if (!model) break;
+
+    tried.push(model);
+
+    const result = await requestModel(model, { system, user, images }, opts);
+
+    if (result.ok) {
+      if (modelInUse && modelInUse !== model) {
+        console.warn(`⚠️  Gemini failover: now using "${model}".`);
       }
-      throw new Error(`Cannot reach the Gemini API: ${err.message}`);
-    }
-
-    if (response.ok) {
-      const data = await response.json();
-      const text = extractText(data);
-
-      if (!text) {
-        const finishReason = data?.candidates?.[0]?.finishReason;
-        const blocked = data?.promptFeedback?.blockReason;
-        throw new Error(
-          blocked
-            ? `Gemini blocked the request (${blocked}).`
-            : `Gemini returned no text (finishReason: ${finishReason ?? 'unknown'}).`
-        );
-      }
+      modelInUse = model;
 
       return {
-        text,
-        model:          data.modelVersion ?? model,
+        text:           result.text,
+        model:          result.model,
         evalDurationMs: Date.now() - startedAt,
       };
     }
 
-    const message = await readError(response);
-    lastError = new Error(toFriendlyError(response.status, message, model));
+    lastError = new Error(result.error);
 
-    // A retired model reads as 404: drop the cached choice, resolve against
-    // the live catalogue and try once more.
-    if (response.status === 404 && attempt === 0) {
-      modelInUse = null;
-      await discoverModel();
-      continue;
-    }
-
-    if (!RETRYABLE_STATUS.has(response.status)) break;
+    if (!FAILOVER_STATUS.has(result.status)) break;
   }
 
-  throw lastError;
+  throw lastError ?? new Error('Gemini produced no answer.');
 };
 
 /**
@@ -341,9 +374,14 @@ export const checkHealth = async () => {
 
   try {
     // Health must fail loudly, so it lists the catalogue directly instead of
-    // going through discoverModel, which swallows listing errors.
-    const ids = await listAvailableModels();
-    const model = pickModel(ids) ?? config.GEMINI_MODEL;
+    // using the cached copy.
+    const ids = await loadCatalogue({ force: true });
+
+    if (ids.length === 0) {
+      throw new Error('the key has no generateContent model available.');
+    }
+
+    const model = ids[0];
     modelInUse = model;
 
     return {
