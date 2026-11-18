@@ -5,7 +5,7 @@
  *
  *   • PDFs            → page-tagged text (citation page numbers stay honest)
  *   • TXT/MD/CSV/JSON → plain text
- *   • PNG/JPG/WEBP    → base64 for the configured Ollama vision model, if any
+ *   • PNG/JPG/WEBP    → base64 for the active multi-modal model, if any
  *
  * Attachments are per-message only: nothing is persisted beyond their names,
  * sizes and MIME types. Total prompt text is capped so the model's context
@@ -14,8 +14,8 @@
 
 import path from 'node:path';
 
-import config from '../../config/env.js';
 import { extractPdfTextFromBuffer } from '../pdf/pdfExtractor.js';
+import { supportsVision } from '../ai/llmService.js';
 
 const TEXT_EXTENSIONS = new Set(['.txt', '.md', '.csv', '.json']);
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -71,7 +71,7 @@ const splitIntoChunks = (text, size) => {
  * @param {Express.Multer.File[]} files
  * @returns {Promise<{
  *   passages: Array<{ documentTitle: string, category: string, academicYear: null, pageNumber: number, score: number, content: string }>,
- *   images: Array<{ name: string, data: string }>,
+ *   images: Array<{ name: string, type: string, data: string }>,
  *   meta: Array<{ name: string, type: string, size: number }>,
  *   notice: string|null
  * }>}
@@ -94,12 +94,16 @@ export const buildAttachmentContext = async (files = []) => {
     });
 
     if (isImageFile(file)) {
-      if (config.OLLAMA_VISION_MODEL) {
-        images.push({ name, data: file.buffer.toString('base64') });
+      if (supportsVision()) {
+        images.push({
+          name,
+          type: file.mimetype || 'image/png',
+          data: file.buffer.toString('base64'),
+        });
       } else {
         notices.push(
-          `"${name}" was not analysed: image understanding needs a vision model ` +
-          '(set OLLAMA_VISION_MODEL, e.g. "llava").'
+          `"${name}" was not analysed: image understanding needs a vision-capable ` +
+          'model (Gemini, or Ollama with OLLAMA_VISION_MODEL, e.g. "llava").'
         );
       }
       continue;

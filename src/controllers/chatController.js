@@ -10,7 +10,7 @@
  *
  * Legacy endpoints kept unchanged for existing clients:
  *   POST   /api/chat/ask                 authenticated ask
- *   GET    /api/chat/health              Ollama status (authenticated)
+ *   GET    /api/chat/health              language-model status (authenticated)
  *   GET    /api/chat/sessions            list sessions (authenticated)
  *   GET    /api/chat/history/:sessionId  one session's messages (authenticated)
  *
@@ -21,7 +21,7 @@
  */
 
 import { answerQuestion }        from '../services/ai/answerService.js';
-import { checkOllamaHealth }     from '../services/ai/ollamaService.js';
+import { checkLlmHealth }        from '../services/ai/llmService.js';
 import { buildAttachmentContext } from '../services/chat/attachmentService.js';
 import {
   normaliseSessionId,
@@ -290,15 +290,16 @@ export const askQuestion = async (req, res, next) => {
 /**
  * GET /api/chat/health
  * Authenticated.
- * Returns the status of the Ollama server and configured model availability.
+ * Returns the status of the active language-model provider (Gemini or Ollama),
+ * including whether the configured model is available to the API key.
  */
-export const ollamaHealthCheck = async (req, res, next) => {
+export const aiHealthCheck = async (req, res, next) => {
   try {
-    const health = await checkOllamaHealth();
+    const health = await checkLlmHealth();
 
     res.status(health.ok ? 200 : 503).json({
-      success: health.ok,
-      ollama:  health,
+      success:  health.ok,
+      provider: health,
     });
   } catch (err) {
     next(err);

@@ -7,31 +7,33 @@
  *
  * Pipeline:
  *   1. Retrieve the most relevant chunks above the similarity threshold.
- *   2. No passages            -> fixed fallback, zero sources, Ollama untouched.
+ *   2. No passages            -> fixed fallback, zero sources, model untouched.
  *   3. Build system + user prompt from the passages.
- *   4. Ask the local Ollama model.
+ *   4. Ask the configured language model (Gemini or Ollama — see llmService).
  *   5. Validate the answer and the CITATIONS line against the passages.
  *   6. Return { success, answer, sources, meta } — sources built from DB fields.
  *
  * meta.reason explains every fallback so the frontend can react:
- *   null                     — a grounded answer was produced
+ *   null                     — a grounded, model-written answer
  *   'no-documents'           — no document has been processed yet
  *   'no-relevant-documents'  — documents exist, none matched the question
  *   'insufficient-context'   — model refused to answer from the passages
- *   'ollama-unavailable'     — local model unreachable / timed out
+ *   'extractive-fallback'    — model unreachable, matching passage quoted instead
+ *   'llm-unavailable'        — model unreachable and there was nothing to quote
  *
- * Failure behaviour: if Ollama is down or times out, the student still gets a
- * valid, honest response (the fallback answer) instead of a 500.
+ * Failure behaviour: if the model is down or times out, the student still gets
+ * a valid answer built from the retrieved document text instead of a 500.
  */
 
 import { retrieveChunks } from '../rag/retrievalService.js';
-import { chatCompletion } from './ollamaService.js';
+import { chatCompletion, getModel, getProvider, supportsVision } from './llmService.js';
 import {
   SYSTEM_PROMPT,
   VISION_SYSTEM_PROMPT,
   FALLBACK_ANSWER,
   NO_DOCUMENTS_ANSWER,
   buildUserPrompt,
+  buildExtractiveAnswer,
   processAnswer,
   buildSources,
 } from './promptBuilder.js';
@@ -54,7 +56,7 @@ import config from '../../config/env.js';
  *   success: true,
  *   answer: string,
  *   sources: Array<{ documentTitle: string, pageNumber: number, category: string|null, academicYear: string|null, score: number }>,
- *   meta: { model: string, retrievedChunks: number, usedFallback: boolean, reason: string|null, evalDurationMs: number|null, topScore: number|null, attachmentNotice: string|null, ollamaError?: string }
+ *   meta: { model: string, provider: 'gemini'|'ollama', mode: 'llm'|'extractive'|'fallback', retrievedChunks: number, usedFallback: boolean, reason: string|null, evalDurationMs: number|null, topScore: number|null, attachmentNotice: string|null, llmError?: string }
  * }>}
  */
 export const answerQuestion = async (question, opts = {}) => {
@@ -70,10 +72,12 @@ export const answerQuestion = async (question, opts = {}) => {
 
   const retrieved  = await retrieveChunks(question, retrievalOpts);
   const chunks     = [...attachmentPassages, ...retrieved];
-  const visionModel = attachmentImages.length > 0 ? config.OLLAMA_VISION_MODEL : '';
+  const useVision  = attachmentImages.length > 0 && supportsVision();
+  const provider   = getProvider();
+  const model      = getModel();
 
   // ── Nothing relevant enough — never ask the model ──────────────────────────
-  if (chunks.length === 0 && !visionModel) {
+  if (chunks.length === 0 && !useVision) {
     const hasDocuments = Boolean(await DocumentChunk.exists({ isEmbedded: true }));
 
     return {
@@ -81,7 +85,9 @@ export const answerQuestion = async (question, opts = {}) => {
       answer:  hasDocuments ? FALLBACK_ANSWER : NO_DOCUMENTS_ANSWER,
       sources: [],
       meta: {
-        model:            config.OLLAMA_MODEL,
+        model,
+        provider,
+        mode:             'fallback',
         retrievedChunks:  0,
         usedFallback:     true,
         reason:           hasDocuments ? 'no-relevant-documents' : 'no-documents',
@@ -92,34 +98,40 @@ export const answerQuestion = async (question, opts = {}) => {
     };
   }
 
-  // ── Ask Ollama ────────────────────────────────────────────────────────────
+  // ── Ask the language model ────────────────────────────────────────────────
   let completion;
   try {
-    completion = await chatCompletion(
-      {
-        system: visionModel ? VISION_SYSTEM_PROMPT : SYSTEM_PROMPT,
-        user:   buildUserPrompt(question, chunks, {
-          imageCount: visionModel ? attachmentImages.length : 0,
-        }),
-        images: visionModel ? attachmentImages.map((image) => image.data) : undefined,
-      },
-      visionModel ? { model: visionModel } : undefined
-    );
+    completion = await chatCompletion({
+      system: useVision ? VISION_SYSTEM_PROMPT : SYSTEM_PROMPT,
+      user:   buildUserPrompt(question, chunks, {
+        imageCount: useVision ? attachmentImages.length : 0,
+      }),
+      images: useVision ? attachmentImages : undefined,
+    });
   } catch (err) {
-    console.error('⚠️  Ollama error:', err.message);
+    console.error(`⚠️  ${provider} error:`, err.message);
+
+    // Retrieval worked, so the document text still answers the question even
+    // without a model: quote the best passage and cite its real source.
+    const canQuote = chunks.length > 0;
+
     return {
       success: true,
-      answer:  FALLBACK_ANSWER,
-      sources: [],
+      answer:  canQuote ? buildExtractiveAnswer(chunks) : FALLBACK_ANSWER,
+      sources: canQuote
+        ? buildSources(chunks, { citedPassages: [1], usedFallback: false })
+        : [],
       meta: {
-        model:            visionModel || config.OLLAMA_MODEL,
+        model,
+        provider,
+        mode:             canQuote ? 'extractive' : 'fallback',
         retrievedChunks:  chunks.length,
-        usedFallback:     true,
-        reason:           'ollama-unavailable',
+        usedFallback:     !canQuote,
+        reason:           canQuote ? 'extractive-fallback' : 'llm-unavailable',
         evalDurationMs:   null,
         topScore:         chunks[0]?.score ?? null,
         attachmentNotice,
-        ollamaError:      err.message,
+        llmError:         err.message,
       },
     };
   }
@@ -134,6 +146,8 @@ export const answerQuestion = async (question, opts = {}) => {
     sources,
     meta: {
       model:            completion.model,
+      provider,
+      mode:             'llm',
       retrievedChunks:  chunks.length,
       usedFallback:     processed.usedFallback,
       reason:           processed.usedFallback ? 'insufficient-context' : null,

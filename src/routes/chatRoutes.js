@@ -6,7 +6,7 @@ import {
   getConversation,
   deleteConversationHandler,
   askQuestion,
-  ollamaHealthCheck,
+  aiHealthCheck,
   getConversationHistory,
   listSessions,
 } from '../controllers/chatController.js';
@@ -40,7 +40,7 @@ router.get('/history', optionalAuthenticate, listHistory);
 router.post('/ask', authenticate, askQuestion);
 
 // GET /api/chat/health
-router.get('/health', authenticate, ollamaHealthCheck);
+router.get('/health', authenticate, aiHealthCheck);
 
 // GET /api/chat/sessions
 router.get('/sessions', authenticate, listSessions);

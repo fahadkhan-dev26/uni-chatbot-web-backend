@@ -61,6 +61,26 @@ const config = {
   RAG_TOP_K:            parseInt(process.env.RAG_TOP_K, 10)            || 5,
   RAG_MIN_SCORE:        parseFloat(process.env.RAG_MIN_SCORE)          || 0.35,
 
+  // ── Language model provider ──────────────────────────────────────────────
+  // 'gemini' — Google AI Studio REST API; reachable from serverless hosts.
+  // 'ollama' — local inference; only usable when the process can reach it.
+  // Defaults to gemini as soon as a key exists, so production works without
+  // a tunnel, while local development keeps using Ollama.
+  LLM_PROVIDER: (
+    process.env.LLM_PROVIDER ||
+    (process.env.GEMINI_API_KEY ? 'gemini' : 'ollama')
+  ).toLowerCase(),
+  LLM_TEMPERATURE: parseFloat(process.env.LLM_TEMPERATURE) || 0.1,
+
+  // Gemini
+  GEMINI_API_KEY:    process.env.GEMINI_API_KEY || '',
+  GEMINI_MODEL:      process.env.GEMINI_MODEL   || 'gemini-2.5-flash',
+  GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS, 10) || 30_000,
+  // Thinking models spend part of this budget before writing the answer, so
+  // the default is larger than the Ollama one; a citation-tailed answer is
+  // only ~200 tokens.
+  GEMINI_MAX_TOKENS: parseInt(process.env.GEMINI_MAX_TOKENS, 10) || 2048,
+
   // Ollama
   OLLAMA_BASE_URL:    process.env.OLLAMA_BASE_URL    || 'http://localhost:11434',
   OLLAMA_MODEL:       process.env.OLLAMA_MODEL       || 'llama3.2',

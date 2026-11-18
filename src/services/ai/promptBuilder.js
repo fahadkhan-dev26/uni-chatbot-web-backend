@@ -80,25 +80,21 @@ CITATIONS: 1, 3
 If you answered only from the images, omit the CITATIONS line entirely. Never invent a passage number, document title, or page number.`;
 
 /**
- * Phrases that indicate the model is uncertain or going off-context.
- * If the model's output contains any of these (case-insensitive), we
- * substitute the fallback answer to prevent hallucinated responses.
+ * Opening phrases that mean the model refused to answer from the passages.
+ *
+ * These are matched only at the start of the reply: hedging words such as
+ * "not available" or "not provided" also appear inside perfectly good answers
+ * ("the scholarship is not available to part-time students"), so a substring
+ * match anywhere in the text used to replace valid answers with the fallback.
  */
-const UNCERTAINTY_SIGNALS = [
-  "i don't know",
-  "i do not know",
-  "i cannot find",
-  "i can't find",
-  "not mentioned",
-  "not provided",
-  "not available in",
-  "no information",
-  "i'm not sure",
-  "i am not sure",
-  "cannot answer",
-  "not in the context",
-  "not in the provided",
-  "outside the scope",
+const REFUSAL_PATTERNS = [
+  /^i (do not|don't) (know|have)/i,
+  /^i (can(no|')t|cannot|could not|couldn't|am not able to) (find|answer|determine|locate|help with)/i,
+  /^i('m| am) (sorry|not sure|unable)/i,
+  /^sorry[,. ]/i,
+  /^no information (is|was|has been) (available|provided|found)/i,
+  /^the (provided |supplied |available )?(passages|documents|context) (do not|does not|don't|doesn't)/i,
+  /^there is no (information|mention|details?)/i,
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -214,9 +210,8 @@ export const processAnswer = (rawAnswer, passageCount = 0) => {
     return { answer: FALLBACK_ANSWER, usedFallback: true, citedPassages: [] };
   }
 
-  // Uncertainty signals detected inside the answer
-  const lowerAnswer = cleaned.toLowerCase();
-  if (UNCERTAINTY_SIGNALS.some((signal) => lowerAnswer.includes(signal))) {
+  // Refusal opener detected
+  if (REFUSAL_PATTERNS.some((pattern) => pattern.test(cleaned))) {
     return { answer: FALLBACK_ANSWER, usedFallback: true, citedPassages: [] };
   }
 
@@ -230,6 +225,73 @@ export const processAnswer = (rawAnswer, passageCount = 0) => {
     .sort((a, b) => a - b);
 
   return { answer: cleaned, usedFallback: false, citedPassages };
+};
+
+/**
+ * Note appended to a quoted passage when the model could not be reached.
+ * Without a working model the honest answer is the document text itself —
+ * the student asked about a document the university published, so the
+ * matching passage is still useful.
+ */
+export const EXTRACTIVE_NOTE =
+  'The AI summariser is unavailable right now, so this is the matching passage ' +
+  'from the university document instead of a written summary.';
+
+const MAX_EXCERPT_CHARS = 900;
+
+const truncateAtSentence = (text, maxChars) => {
+  if (text.length <= maxChars) return text;
+
+  const window = text.slice(0, maxChars);
+  const lastStop = Math.max(
+    window.lastIndexOf('. '),
+    window.lastIndexOf('? '),
+    window.lastIndexOf('! ')
+  );
+
+  if (lastStop >= maxChars * 0.5) return window.slice(0, lastStop + 1).trim();
+
+  const lastSpace = window.lastIndexOf(' ');
+  return `${window.slice(0, lastSpace > 0 ? lastSpace : maxChars).trim()}…`;
+};
+
+// Titles come from admin input; markdown control characters would break the
+// rendered answer, so they are stripped rather than escaped.
+const safeTitle = (title) =>
+  String(title ?? '').replace(/[*_`[\]<>#|]/g, '').trim() || 'University document';
+
+/**
+ * Builds a quoted-excerpt answer from the best retrieved passage.
+ *
+ * Used when retrieval succeeded but the language model is unreachable, so the
+ * student receives the actual document content plus its source instead of an
+ * apology that implies the document says nothing.
+ *
+ * @param {import('../rag/retrievalService.js').RetrievalResult[]} chunks
+ * @param {{ maxChars?: number }} [opts]
+ * @returns {string}
+ */
+export const buildExtractiveAnswer = (chunks = [], { maxChars = MAX_EXCERPT_CHARS } = {}) => {
+  const chunk = chunks.find(
+    (candidate) => typeof candidate?.content === 'string' && candidate.content.trim()
+  );
+
+  if (!chunk) return FALLBACK_ANSWER;
+
+  const body = truncateAtSentence(
+    chunk.content.replace(/\r/g, '').replace(/[ \t]+/g, ' ').trim(),
+    maxChars
+  );
+  const page = Number.isInteger(chunk.pageNumber) ? `, page ${chunk.pageNumber}` : '';
+  const quote = body.split('\n').map((line) => `> ${line}`).join('\n');
+
+  return [
+    `Here is the passage from **${safeTitle(chunk.documentTitle)}**${page} that matches your question:`,
+    '',
+    quote,
+    '',
+    `_${EXTRACTIVE_NOTE}_`,
+  ].join('\n');
 };
 
 /**
