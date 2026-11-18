@@ -25,13 +25,23 @@
  * Output dimensions: 384 floats per text input.
  */
 
-import { pipeline, env } from '@huggingface/transformers';
 import config from '../../config/env.js';
 
-// ── Configure the HF runtime ──────────────────────────────────────────────────
-env.cacheDir           = config.EMBEDDING_MODEL_DIR;  // where models are cached
-env.allowLocalModels   = true;   // read from cache if available
-env.allowRemoteModels  = true;   // download on first use
+// Loaded on first use, not at import time: the native onnxruntime binding
+// fails to load in some serverless runtimes and would otherwise take down
+// every route (including /api/health) during function initialisation.
+let _transformers = null;
+const loadTransformers = async () => {
+  if (_transformers) return _transformers;
+
+  const mod = await import('@huggingface/transformers');
+  mod.env.cacheDir          = config.EMBEDDING_MODEL_DIR;  // where models are cached
+  mod.env.allowLocalModels  = true;   // read from cache if available
+  mod.env.allowRemoteModels = true;   // download on first use
+
+  _transformers = mod;
+  return _transformers;
+};
 
 /** @type {import('@huggingface/transformers').FeatureExtractionPipeline | null} */
 let _embedder = null;
@@ -55,6 +65,7 @@ export const getEmbedder = async () => {
     console.log(`    Cache dir: ${config.EMBEDDING_MODEL_DIR}`);
     console.log('    (First run downloads ~90 MB — subsequent starts are instant)');
 
+    const { pipeline } = await loadTransformers();
     const extractor = await pipeline('feature-extraction', model, {
       // quantized: true reduces model size ~4x with minimal accuracy loss
       // set to false for maximum accuracy if disk/RAM is not a concern
