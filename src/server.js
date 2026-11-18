@@ -1,6 +1,8 @@
+import { pathToFileURL } from 'node:url';
 import app from './app.js';
 import config from './config/env.js';
 import connectDB, { disconnectDB } from './config/db.js';
+import handler from './serverless.js';
 
 const PORT = config.PORT;
 
@@ -56,4 +58,11 @@ const bootstrap = async () => {
   }
 };
 
-bootstrap();
+// Only start a listener when executed directly (`node src/server.js`).
+// Serverless platforms import this file and use the handler export instead.
+const isDirectRun =
+  Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) bootstrap();
+
+export default handler;
