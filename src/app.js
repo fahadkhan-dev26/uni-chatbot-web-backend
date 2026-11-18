@@ -38,6 +38,15 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/api', apiLimiter);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'University AI Chatbot API',
+    health: '/api/health',
+    endpoints: ['/api/system/status', '/api/auth', '/api/documents', '/api/rag', '/api/chat'],
+  });
+});
+
 app.use('/api/health',    healthRoutes);
 app.use('/api/system',    systemRoutes);
 app.use('/api/auth',      authRoutes);
